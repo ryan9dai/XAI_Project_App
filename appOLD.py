@@ -1,0 +1,605 @@
+import math
+import streamlit as st
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import shap
+import matplotlib.pyplot as plt
+
+from scipy.stats import norm as scinorm
+
+# ---------------------------
+#  CONFIG
+# ---------------------------
+config = {
+    "SEQ_LENGTH":         20,
+    "HORIZON":             1,
+    "DEVICE":  torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    "d_model":            64,
+    "nhead":               2,
+    "num_encoder_layers":  2,
+    "kafin_hidden":       32
+}
+
+# ---------------------------
+#  MODEL DEFINITIONS
+# ---------------------------
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=500):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x):
+        # x: (B, L, D)
+        return x + self.pe[:, : x.size(1)]
+
+class CNN_Attention_MLP(nn.Module):
+    def __init__(self, window, horizon, feat_dim=6):
+        super().__init__()
+        self.conv1 = nn.Conv1d(feat_dim, 64, 3, padding=1)
+        self.bn1   = nn.BatchNorm1d(64)
+        self.conv2 = nn.Conv1d(64, 128, 3, padding=1)
+        self.bn2   = nn.BatchNorm1d(128)
+        self.conv3 = nn.Conv1d(128, 256, 3, padding=1)
+        self.bn3   = nn.BatchNorm1d(256)
+
+        self.posenc = PositionalEncoding(d_model=256, max_len=window)
+        self.attn   = nn.MultiheadAttention(embed_dim=256, num_heads=8, batch_first=True)
+
+        self.fc = nn.Sequential(
+            nn.Linear(256 * window, 1024), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(1024, 512),           nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(512, 128),            nn.ReLU(),
+            nn.Linear(128, horizon)
+        )
+
+    def forward(self, x):
+        # x: (B, feat_dim, window)
+        o = F.relu(self.bn1(self.conv1(x)))
+        o = F.relu(self.bn2(self.conv2(o)))
+        o = F.relu(self.bn3(self.conv3(o)))      # (B,256,window)
+
+        attn_in = o.transpose(1, 2)              # (B,window,256)
+        attn_in = self.posenc(attn_in)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in)
+        o2 = attn_out + attn_in                  # (B,window,256)
+
+        flat = o2.reshape(o2.size(0), -1)        # (B,256*window)
+        return self.fc(flat)
+
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div_term)
+        pe[:, 1::2] = torch.cos(pos * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: (B, L, D)
+        return self.pe[: x.size(1), :]
+
+class OptionPositionalEncoding(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.linear = nn.Linear(2, d_model)
+
+    def forward(self, specs):
+        # specs: (B, N, 5) → strike, underlying, ttm, r, IV
+        strike, underlying, ttm = specs[..., 0], specs[..., 1], specs[..., 2]
+        log_m = torch.log((underlying + 1e-6) / (strike + 1e-6))
+        feats = torch.stack([log_m, ttm], dim=-1)  # (B,N,2)
+        return self.linear(feats)                 # (B,N,d_model)
+
+class InformerModel(nn.Module):
+    def __init__(self, feature_dim, d_model, nhead, num_encoder_layers):
+        super().__init__()
+        self.input_linear = nn.Linear(feature_dim, d_model)
+        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=False)
+        self.transformer_encoder = nn.TransformerEncoder(enc_layer, num_encoder_layers)
+        self.option_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=nhead, batch_first=True)
+        self.output_linear = nn.Linear(d_model, 1)
+        self.attn_norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, time_pe, option_pe, option_key_padding_mask=None):
+        B, T, N, F = x.shape
+        dev = x.device
+
+        # add positional encodings
+        x = self.input_linear(x) \
+            + time_pe.to(dev).unsqueeze(0).unsqueeze(2) \
+            + option_pe.to(dev).unsqueeze(1)
+
+        # (T, B*N, d_model)
+        x = x.permute(0, 2, 1, 3).contiguous().view(B * N, T, -1).transpose(0, 1)
+        x = self.transformer_encoder(x).transpose(0, 1)[:, -1, :].view(B, N, -1)
+
+        if option_key_padding_mask is not None:
+            option_key_padding_mask = option_key_padding_mask.bool()
+
+        # full-precision attention
+        x_fp32 = x.float()
+        with torch.cuda.amp.autocast(enabled=False):
+            attn_out, _ = self.option_attn(x_fp32, x_fp32, x_fp32, key_padding_mask=option_key_padding_mask)
+        attn_out = attn_out.to(x.dtype)
+
+        x = x + attn_out
+        x = self.attn_norm(x)
+        return self.output_linear(x)  # (B,N,1)
+
+class KAFINBlock(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.h_funcs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(1, hidden_dim), nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            ) for _ in range(input_dim)
+        ])
+        self.attn_query    = nn.Linear(input_dim, hidden_dim)
+        self.attn_key    = nn.Linear(input_dim, hidden_dim)
+        self.attn_score= nn.Linear(hidden_dim, input_dim)
+        self.cross     = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim,1))
+        self.g_func    = nn.Sequential(nn.Linear(1, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim,1))
+
+    def forward(self, x):
+        # x: (B*N, D)
+        h_outs = [fn(x[:, j:j+1]) for j, fn in enumerate(self.h_funcs)]
+        h_cat  = torch.cat(h_outs, dim=1)             # (B*N, D)
+        q, k   = self.attn_query(h_cat), self.attn_key(h_cat)
+        scores = self.attn_score(torch.tanh(q * k))
+        wts    = torch.softmax(scores, dim=1)
+        weighted= (h_cat * wts).sum(dim=1, keepdim=True)
+        cross  = self.cross(h_cat)
+        comb   = weighted + cross
+        return self.g_func(comb)                      # (B*N,1)
+
+class KAFINPricer(nn.Module):
+    def __init__(self, input_dim=5, hidden_dim=32, L2=3):
+        super().__init__()
+        self.blocks = nn.ModuleList([KAFINBlock(input_dim, hidden_dim) for _ in range(L2)])
+
+    def forward(self, x):
+        B, N, D = x.shape
+        x_flat = x.view(B * N, D)
+        outs   = [blk(x_flat) for blk in self.blocks]
+        total  = torch.stack(outs, dim=2).sum(2)       # (B*N,1)
+        return total.view(B, N, 1)                    # (B,N,1)
+
+class OptionPricingPipeline(nn.Module):
+    def __init__(self, informer, kafin):
+        super().__init__()
+        self.inf   = informer
+        self.kaf   = kafin
+        self.option_pe = OptionPositionalEncoding(config["d_model"]).to(config["DEVICE"])
+
+    def forward(self, seq, tp, specs, option_mask):
+        op = self.option_pe(specs)
+        iv = self.inf(seq, tp, op, option_key_padding_mask=option_mask)
+        price = self.kaf(torch.cat([specs, iv], dim=-1))
+        return iv, price
+
+# ---------------------------
+#  LOAD MODELS & STATS
+# ---------------------------
+
+# @st.cache_resource
+# def load_models():
+#     # MLP
+#     mlp = CNN_Attention_MLP(window=config["SEQ_LENGTH"], horizon=config["HORIZON"], feat_dim=6)
+#     mlp.load_state_dict(torch.load(
+#         r'C:\Users\ryan9\Documents\Projects\XAI\XAI_Project_App\models\bestMLPmodel.pth',
+#         map_location='cpu'
+#     ))
+#     mlp = mlp.to(config["DEVICE"]).eval()
+
+#     # Informer+KAFIN
+#     inf  = InformerModel(
+#         feature_dim=14,
+#         d_model=config["d_model"],
+#         nhead=config["nhead"],
+#         num_encoder_layers=config["num_encoder_layers"]
+#     )
+#     kaf  = KAFINPricer(input_dim=5, hidden_dim=config["kafin_hidden"], L2=3)
+#     pipeline = OptionPricingPipeline(inf, kaf)
+
+#     ckpt = torch.load(
+#         r'C:\Users\ryan9\Documents\Projects\XAI\XAI_Project_App\models\bestITMATMmodel.pth',
+#         map_location='cpu'
+#     )
+#     pipeline.load_state_dict(ckpt)
+#     pipeline = pipeline.to(config["DEVICE"]).eval()
+
+#     return mlp, pipeline
+
+@st.cache_resource
+def load_models():
+    # --- build MLP ---
+    mlp = CNN_Attention_MLP(
+        window=config["SEQ_LENGTH"],
+        horizon=config["HORIZON"],
+        feat_dim=6
+    )
+    mlp.load_state_dict(torch.load(
+        r'C:\Users\ryan9\Documents\Projects\XAI\XAI_Project_App\models\bestMLPmodel.pth',
+        map_location='cpu'
+    ))
+    mlp = mlp.to(config["DEVICE"]).eval()  # move to device and eval mode
+
+    # --- build Informer+KAFIN pipeline ---
+    inf = InformerModel(
+        feature_dim=14,
+        d_model=config["d_model"],
+        nhead=config["nhead"],
+        num_encoder_layers=config["num_encoder_layers"]
+    )
+    kaf = KAFINPricer(
+        input_dim=5,
+        hidden_dim=config["kafin_hidden"],
+        L2=3
+    )
+    pipeline = OptionPricingPipeline(inf, kaf)
+
+    ckpt = torch.load(
+        r'C:\Users\ryan9\Documents\Projects\XAI\XAI_Project_App\models\bestITMATMmodel.pth',
+        map_location='cpu'
+    )
+    pipeline.load_state_dict(ckpt)
+    pipeline = pipeline.to(config["DEVICE"]).eval()  # move to device and eval mode
+
+    return mlp, pipeline
+
+
+@st.cache_data
+def load_stats():
+    # Load summary statistics from CSV file
+    stats_df = pd.read_csv(
+        r"C:\Users\ryan9\Documents\Projects\XAI\XAI_Project_App\data\summary_stats.csv"
+    )
+    
+    # Convert to dictionary mapping
+    stats = {}
+    # Map feature names to what the app expects
+    feature_map = {
+        'underlying_price': 'UNDERLYING_LAST',
+        'strike': 'STRIKE',
+        'time_to_maturity': 'time_to_maturity',
+        'IV': 'IV'
+    }
+    
+    for _, row in stats_df.iterrows():
+        feature = row['feature']
+        if feature in feature_map:
+            key = feature_map[feature]
+            stats[key] = (row['mean'], row['std'])
+    
+    return stats
+
+mlp_model, pipeline_model = load_models()
+stats = load_stats()
+
+# ---------------------------
+#  STREAMLIT APP
+# ---------------------------
+
+st.title("Option Pricing & Explainability Demo")
+st.sidebar.header("Option Parameters")
+
+S  = st.sidebar.number_input("Underlying Price (S)",     value=260.0)
+K  = st.sidebar.number_input("Strike Price (K)",         value=250.0)
+T  = st.sidebar.number_input("Time to Maturity (years)", value=0.25)
+IV = st.sidebar.number_input("Implied Volatility",       value=0.55)
+r  = st.sidebar.number_input("Interest Rate",            value=0.015)
+
+model_choice = st.sidebar.selectbox("Model", ["MLP","Informer+KAFIN", "Black‑Scholes"])
+
+# Add Informer+KAFIN feature selection in sidebar, but only show when that model is selected
+option_features = ["Strike Price", "Underlying Price", "Time to Maturity", "Interest Rate", "Implied Volatility"]
+if model_choice == "Informer+KAFIN":
+    selected_feature = st.sidebar.selectbox("Feature for PDP (Informer+KAFIN)", option_features)
+else:
+    selected_feature = option_features[0]  # Default value when not shown
+
+def norm(col,x):
+    m,s = stats[col]
+    return (x-m)/s
+
+# --- MLP inputs ---
+up      = norm("UNDERLYING_LAST", S)
+st_n    = norm("STRIKE",          K)
+tt_n    = norm("time_to_maturity",T)
+iv_n    = norm("IV",              IV)
+mon     = S/K
+logm    = np.log(mon+1e-8)
+mlp_inputs = np.array([up,st_n,tt_n,mon,logm,iv_n],dtype=np.float32)
+
+# Define the inverse normalization function
+def denorm(col, x):
+    m, s = stats[col]
+    return x * s + m
+
+# pad to 20 timesteps
+inp = np.zeros((6,config["SEQ_LENGTH"]),dtype=np.float32)
+# inp[:,0] = mlp_inputs
+# instead of only inp[:,0] = mlp_inputs, do:
+for t in range(20):
+    inp[:,t] = mlp_inputs
+
+mlp_tensor = torch.tensor(inp[None,:,:], dtype=torch.float32, device=config["DEVICE"])  # (1,6,20)
+
+# --- Pipeline inputs ---
+# Combine MLP inputs with additional features - total should be 14 to match model's feature_dim=14
+feat14 = np.concatenate([mlp_inputs, np.zeros(8, dtype=np.float32)])
+# Shape needs to be (B=1, T=1, N=1, F=14) to match model initialization
+seq_full = torch.tensor(feat14.reshape(1, 1, 1, 14), 
+                       dtype=torch.float32,
+                       device=config["DEVICE"])
+# Option specs with dimensions B=1, N=1, specs=5 (strike, underlying, ttm, r, IV)
+specs = torch.tensor([[[K, S, T, r, IV]]], 
+                     dtype=torch.float32,
+                     device=config["DEVICE"])
+
+if model_choice=="MLP":
+    # Move everything to CPU
+    cpu_model  = mlp_model.cpu().eval()
+    cpu_tensor = mlp_tensor.cpu()
+
+    # 1) Compute price
+    with torch.no_grad():
+        logy = cpu_model(cpu_tensor).item()   # model returns log(price)
+    price = np.exp(logy)
+    st.subheader(f"MLP Price: {price:.4f}")
+
+    # 2) Gradient×Input importances on CPU
+    cpu_tensor = cpu_tensor.clone().detach().requires_grad_(True)
+    cpu_model.zero_grad()
+    out = cpu_model(cpu_tensor)              # shape (1,1)
+    out.backward()
+
+    # grab gradients & normalized inputs at t=0
+    grads       = cpu_tensor.grad[0, :, 0].numpy()      # ∂logy/∂x_i
+    inputs_norm = cpu_tensor.detach()[0, :, 0].numpy()  # normalized x_i
+    attribs     = inputs_norm * grads                  # grad×input
+
+    feat_names = [
+        "Underlying Price","Strike Price",
+        "Time to Maturity","Moneyness",
+        "Log‑Moneyness","Implied Volatility"
+    ]
+
+    fig, ax = plt.subplots(figsize=(7,3))
+    ax.bar(feat_names, np.abs(attribs), color="C1")
+    ax.set_ylabel("|∂y/∂x · x|")
+    ax.set_xticklabels(feat_names, rotation=45, ha="right")
+    ax.set_title("MLP Feature Importances (|grad×input|)")
+    plt.tight_layout()
+    st.pyplot(fig)
+
+    # 3) PDP on CPU
+    sel = st.sidebar.selectbox("Feature for PDP", feat_names)
+    idx = feat_names.index(sel)
+
+    # build normalized grid
+    base_val = mlp_inputs[idx]
+    grid_norm = np.linspace(base_val * 0.5, base_val * 1.5, 50)
+
+    # helper to denormalize for x-axis
+    def denorm(col, x): return x * stats[col][1] + stats[col][0]
+    if idx == 0:
+        xs = [denorm("UNDERLYING_LAST", v) for v in grid_norm]
+    elif idx == 1:
+        xs = [denorm("STRIKE", v) for v in grid_norm]
+    elif idx == 2:
+        xs = [denorm("time_to_maturity", v) for v in grid_norm]
+    elif idx in (3,4):
+        xs = grid_norm
+    else:
+        xs = [denorm("IV", v) for v in grid_norm]
+
+    pdp_vals = []
+    for v in grid_norm:
+        arr = mlp_inputs.copy()
+        arr[idx] = v
+        padded = np.zeros((6, config["SEQ_LENGTH"]), dtype=np.float32)
+        padded[:, 0] = arr
+        t_in = torch.tensor(padded[None], dtype=torch.float32)
+        with torch.no_grad():
+            lp = cpu_model(t_in).item()
+        pdp_vals.append(np.exp(lp))
+
+    fig2, ax2 = plt.subplots(figsize=(8,5))
+    ax2.plot(xs, pdp_vals, linewidth=2)
+    ax2.set_xlabel(sel)
+    ax2.set_ylabel("Option Price")
+    ax2.set_title(f"PDP for {sel}")
+    ax2.grid(alpha=0.3)
+    st.pyplot(fig2)
+
+elif model_choice == "Informer+KAFIN":
+    try:
+        # Create time positional encoding exactly as in notebook
+        T = seq_full.shape[1]  # Should be 1
+        
+        # Print shapes for debugging
+        # st.write(f"seq_full shape: {seq_full.shape}, specs shape: {specs.shape}")
+        
+        # Create positional encoding from scratch to match notebook exactly
+        d_model = config["d_model"]
+        pe = torch.zeros(T, d_model)
+        position = torch.arange(0, T, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        # st.write(f"pe shape: {pe.shape}")
+        
+        # Move pe to the right device
+        pe = pe.to(config["DEVICE"])
+        
+        # Create an option mask where False means no padding (all valid)
+        option_mask = torch.zeros(1, 1, dtype=torch.bool, device=config["DEVICE"])
+        
+        with torch.no_grad():
+            try:
+                iv_pred, pr_pred = pipeline_model(seq_full, pe, specs, option_mask=option_mask)
+                st.subheader(f"Informer IV: {iv_pred.item():.4f}")
+                st.subheader(f"Informer+KAFIN Price: {pr_pred.item():.4f}")
+            except Exception as e1:
+                st.error(f"First attempt failed: {str(e1)}")
+                # Try with unsqueezed pe
+                try:
+                    iv_pred, pr_pred = pipeline_model(seq_full, pe.unsqueeze(0), specs, option_mask=option_mask)
+                    st.subheader(f"Informer IV: {iv_pred.item():.4f}")
+                    st.subheader(f"Informer+KAFIN Price: {pr_pred.item():.4f}")
+                except Exception as e2:
+                    st.error(f"Second attempt failed: {str(e2)}")
+                    raise e2
+
+        # Show individual KAFIN block contributions
+        kaf_in = torch.cat([specs, iv_pred], dim=-1).view(1, -1)
+        with torch.no_grad():
+            raws = [blk(kaf_in).item() for blk in pipeline_model.kaf.blocks]
+
+        fig3, ax3 = plt.subplots()
+        ax3.bar(
+            range(len(raws)), 
+            raws,
+            tick_label=[f"Block {i+1}" for i in range(len(raws))]
+        )
+        ax3.set_ylabel("Contribution")
+        ax3.set_title("KAFIN Block Outputs")
+        st.pyplot(fig3)
+        
+        # Add PDP for Informer+KAFIN model
+        st.subheader("PDP for Informer+KAFIN Model")
+        
+        # Use the feature selected in the sidebar
+        feature_idx = option_features.index(selected_feature)
+        
+        # Create grid of values for the selected feature
+        if feature_idx == 0:  # Strike
+            base = specs[0, 0, 0].item()
+            grid_values = np.linspace(base * 0.7, base * 1.3, 30)
+        elif feature_idx == 1:  # Underlying
+            base = specs[0, 0, 1].item()
+            grid_values = np.linspace(base * 0.7, base * 1.3, 30)
+        elif feature_idx == 2:  # Time to maturity
+            base = specs[0, 0, 2].item()
+            grid_values = np.linspace(max(0.01, base * 0.5), base * 2.0, 30)
+        elif feature_idx == 3:  # Interest rate
+            base = specs[0, 0, 3].item()
+            grid_values = np.linspace(max(0.001, base * 0.5), base * 2.0, 30)
+        else:  # IV
+            base = specs[0, 0, 4].item()
+            grid_values = np.linspace(max(0.01, base * 0.5), base * 1.5, 30)
+        
+        # Generate PDP values
+        pdp_prices = []
+        
+        with torch.no_grad():
+            for val in grid_values:
+                # Create modified specs
+                mod_specs = specs.clone()
+                mod_specs[0, 0, feature_idx] = val
+                
+                # Get model prediction
+                _, price_pred = pipeline_model(seq_full, pe, mod_specs, option_mask=option_mask)
+                pdp_prices.append(price_pred.item())
+        
+        # Plot PDP
+        fig4, ax4 = plt.subplots(figsize=(8, 5))
+        ax4.plot(grid_values, pdp_prices, 'b-', linewidth=2)
+        ax4.set_xlabel(selected_feature, fontsize=12)
+        ax4.set_ylabel("Predicted Option Price", fontsize=12)
+        ax4.set_title(f"Partial Dependence Plot for {selected_feature}", fontsize=14)
+        ax4.grid(True, alpha=0.3)
+        ax4.tick_params(axis='both', labelsize=10)
+        plt.tight_layout()
+        st.pyplot(fig4)
+    except Exception as e:
+        st.error(f"Error in Informer+KAFIN model: {type(e).__name__}: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
+
+elif model_choice == "Black-Scholes":
+    # 1) Black–Scholes formula using the true normal CDF
+    def bs_call_price(S, K, T, r, sigma):
+        if T <= 0:
+            return max(0.0, S - K)
+        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        return float(
+            S * scinorm.cdf(d1)
+            - K * np.exp(-r * T) * scinorm.cdf(d2)
+        )
+
+    # compute & display price
+    bs_price = bs_call_price(S, K, T, r, IV)
+    st.subheader(f"Black–Scholes Price: {bs_price:.4f}")
+
+    # 2) SHAP importances via KernelExplainer (CPU only)
+    def bs_batch(x_array):
+        # x_array shape (m,5): [S, K, T, r, IV]
+        return np.array([bs_call_price(*row) for row in x_array])
+
+    background = np.tile([S, K, T, r, IV], (50, 1))
+    explainer  = shap.KernelExplainer(bs_batch, background)
+    shap_vals  = explainer.shap_values(np.array([S, K, T, r, IV]), nsamples=100)
+
+    feat_names = ["S", "K", "T", "r", "IV"]
+    fig_shap, ax_shap = plt.subplots(figsize=(8, 4))
+    xt = np.arange(len(feat_names))
+    ax_shap.bar(
+        x=xt,
+        height=np.abs(shap_vals),
+        width=0.6,
+        color="C3",
+        edgecolor="k"
+    )
+    ax_shap.set_xticks(xt)
+    ax_shap.set_xticklabels(feat_names, rotation=45, ha="right")
+    ax_shap.set_ylabel("|SHAP value|")
+    ax_shap.set_title("Black–Scholes Feature Importances (|SHAP|)")
+    plt.tight_layout()
+    st.pyplot(fig_shap)
+
+    # 3) Partial Dependence Plot (dropdown in sidebar)
+    sel = st.sidebar.selectbox("BS PDP Feature", feat_names)
+    idx = feat_names.index(sel)
+
+    # define a sensible grid for each feature
+    if sel == "S":
+        grid = np.linspace(S * 0.5, S * 1.5, 50)
+    elif sel == "K":
+        grid = np.linspace(K * 0.5, K * 1.5, 50)
+    elif sel == "T":
+        grid = np.linspace(max(1e-3, T * 0.1), T * 2.0, 50)
+    elif sel == "r":
+        grid = np.linspace(max(0.0, r - 0.05), r + 0.05, 50)
+    else:  # IV
+        grid = np.linspace(max(1e-3, IV * 0.5), IV * 1.5, 50)
+
+    pdp = []
+    for val in grid:
+        args = [S, K, T, r, IV]
+        args[idx] = val
+        pdp.append(bs_call_price(*args))
+
+    fig_pdp, ax_pdp = plt.subplots(figsize=(8, 5))
+    ax_pdp.plot(grid, pdp, 'b-', linewidth=2)
+    ax_pdp.set_xlabel(sel)
+    ax_pdp.set_ylabel("Option Price")
+    ax_pdp.set_title(f"PDP for {sel}")
+    ax_pdp.grid(alpha=0.3)
+    plt.tight_layout()
+    st.pyplot(fig_pdp)

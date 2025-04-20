@@ -198,7 +198,6 @@ ticker = st.sidebar.text_input("Ticker", value="TSLA")
 K      = st.sidebar.number_input("Strike Price (K)", value=250.0)
 T      = st.sidebar.number_input("Time to Maturity (years)", value=0.25)
 r      = st.sidebar.number_input("Risk-Free Rate (r)", value=0.015)
-IV_in  = st.sidebar.number_input("Implied Volatility (for MLP/Informer)", value=0.55)
 model_choice = st.sidebar.selectbox("Model", ["MLP","Informer+KAFIN","GARCH+Black-Scholes"])
 
 # Fetch last 20 trading days
@@ -206,6 +205,10 @@ data = yf.Ticker(ticker).history(period="1mo").dropna().iloc[-config["SEQ_LENGTH
 last_date = data.index[-1].date()
 pred_date = last_date + pd.Timedelta(days=1)
 st.sidebar.markdown(f"Last data date: **{last_date}**  \nPredicting: **{pred_date}**")
+
+# Calculate realized volatility
+returns = np.log(data["Close"] / data["Close"].shift(1)).dropna()
+realized_vol = np.std(returns) * np.sqrt(252)
 
 # Derived from last day
 S_last = float(data["Close"].iloc[-1])
@@ -218,7 +221,7 @@ st.write({
     "Strike (K)":        K,
     "Time to Maturity":  T,
     "Interest Rate (r)": r,
-    "Implied Volatility": IV_in if model_choice!="GARCH+Black-Scholes" else "From GARCH",
+    "Realized Volatility": f"{realized_vol:.4f}",
     "Moneyness":         moneyness,
     "Log-Moneyness":     logm
 })
@@ -241,7 +244,7 @@ for i in range(config["SEQ_LENGTH"]):
     up = norm("UNDERLYING_LAST", u)
     stn= norm("STRIKE",          K)
     ttn= norm("time_to_maturity",T)
-    ivn= norm("IV",              IV_in)
+    ivn= norm("IV",              realized_vol)
     mon= u/K
     logm_i = math.log(mon+1e-8)
     inp[:, i] = [up, stn, ttn, mon, logm_i, ivn]
@@ -254,20 +257,22 @@ for i in range(config["SEQ_LENGTH"]):
     up = norm("UNDERLYING_LAST", u)
     stn= norm("STRIKE", K)
     ttn= norm("time_to_maturity", T)
-    ivn= norm("IV", IV_in)
+    ivn= norm("IV", realized_vol)
     mon= u/K
     logm_i = math.log(mon+1e-8)
     feat14[i,:6] = [up, stn, ttn, mon, logm_i, ivn]
 seq_full = torch.tensor(feat14.reshape(1,config["SEQ_LENGTH"],1,14),
                        dtype=torch.float32, device=config["DEVICE"])
+
 # Time positional encoding
 time_pe = torch.zeros(config["SEQ_LENGTH"], config["d_model"], device=config["DEVICE"])
 pos   = torch.arange(0,config["SEQ_LENGTH"],dtype=torch.float32,device=config["DEVICE"]).unsqueeze(1)
 div   = torch.exp(torch.arange(0,config["d_model"],2,device=config["DEVICE"])*(-math.log(10000.0)/config["d_model"]))
 time_pe[:,0::2] = torch.sin(pos*div)
 time_pe[:,1::2] = torch.cos(pos*div)
+
 # Specs & mask
-specs = torch.tensor([[[K, S_last, T, r, IV_in]]], dtype=torch.float32, device=config["DEVICE"])
+specs = torch.tensor([[[K, S_last, T, r, realized_vol]]], dtype=torch.float32, device=config["DEVICE"])
 option_mask = torch.zeros(1,1, dtype=torch.bool, device=config["DEVICE"])
 
 # Feature list for PDP
@@ -308,7 +313,7 @@ if model_choice == "MLP":
         "Time to Maturity":  T,
         "Moneyness":         moneyness,
         "Log‑Moneyness":     logm,
-        "Implied Volatility": IV_in
+        "Implied Volatility": realized_vol
     }
     grid = make_grid(pdp_feature, base_vals[pdp_feature])
     pdp = []
@@ -363,7 +368,7 @@ elif model_choice == "Informer+KAFIN":
         "Strike Price":       K,
         "Time to Maturity":   T,
         "Interest Rate":      r,
-        "Implied Volatility": IV_in,
+        "Implied Volatility": realized_vol,
         "Moneyness":          moneyness,
         "Log‑Moneyness":      logm
     }

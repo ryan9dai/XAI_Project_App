@@ -1,5 +1,3 @@
-"# XAI_Project_App" 
-
 # 📈 One-Step-Ahead Option Pricing & Explainability (TSLA)
 
 This is a Streamlit app that predicts the **next-day price of a European call option** on **TSLA** using:
@@ -30,7 +28,9 @@ cd XAI_Project_App
 Recommended: Use a virtual environment.
 
 python -m venv XAIvenv
+
 source XAIvenv/bin/activate  # On Windows: XAIvenv\Scripts\activate
+
 pip install torch yfinance numpy pandas matplotlib shap scipy arch
 
 ### ✅ Step 3: Run the app
@@ -94,4 +94,7 @@ For questions or suggestions, contact:
 Ryan Dai at ryan9dai.us@gmail.com
 
 ## 🧠 Academic Disclaimer
-This project is for educational purposes only and is not intended for real trading or financial advice.
+This project is for educational purposes only and is not intended for real trading or financial advice. Please feel free to share this project, and you can include my name.
+
+## Use of AI
+This project was primarily guided by AI and a family member. It was entirely coded using ChatGPT and Claude, using many different models from each.
